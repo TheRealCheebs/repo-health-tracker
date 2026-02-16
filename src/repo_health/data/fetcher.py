@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Tuple
 
 import requests
 from rich.console import Console
+from rich import print as rprint
 
 from ..config.settings import get_settings
 
@@ -64,11 +65,7 @@ class GitHubDataFetcher:
         if not author_obj:
             return {"login": "ghost", "id": None}
 
-        # The object will always have a login from the 'Actor' interface
         info = {"login": author_obj.get("login", "ghost")}
-
-        # The databaseId will only exist if the author is a 'User'
-        # due to our `... on User` fragment
         info["id"] = author_obj.get("databaseId")
 
         return info
@@ -83,12 +80,17 @@ class GitHubDataFetcher:
             query = """
             query($owner: String!, $repo: String!, $cursor: String) {
               repository(owner: $owner, name: $repo) {
-                pullRequests(first: 100, after: $cursor, orderBy: {field: CREATED_AT, direction: DESC}) {
+                pullRequests(
+                  first: 100,
+                  after: $cursor,
+                  orderBy: {field: CREATED_AT, direction: DESC}
+                ) {
                   edges {
                     node {
                       number
                       title
                       state
+                      isDraft
                       createdAt
                       mergedAt
                       mergedBy { login, ... on User { databaseId } }
@@ -137,6 +139,7 @@ class GitHubDataFetcher:
                     "number": raw_pr["number"],
                     "title": raw_pr["title"],
                     "state": raw_pr["state"],
+                    "isDraft": raw_pr.get("isDraft", False),
                     "createdAt": raw_pr["createdAt"],
                     "mergedAt": raw_pr.get("mergedAt"),
                     "author": self._get_author_info(raw_pr.get("author")),
@@ -179,6 +182,9 @@ class GitHubDataFetcher:
                 )
                 < self.start_date
             ):
+                rprint(
+                    f"[yellow]Stopping PR fetch: reached start date {self.start_date.date()}[/yellow]"
+                )
                 normalized_prs = [
                     pr
                     for pr in normalized_prs
@@ -274,6 +280,9 @@ class GitHubDataFetcher:
                 )
                 < self.start_date
             ):
+                rprint(
+                    f"[yellow]Stopping Issue fetch: reached start date {self.start_date.date()}[/yellow]"
+                )
                 normalized_issues = [
                     issue
                     for issue in normalized_issues
@@ -286,6 +295,9 @@ class GitHubDataFetcher:
 
     def fetch_all(self) -> Tuple[int, int]:
         """Fetch all PRs and issues, and save the normalized data."""
+        rprint(
+            f"[bold blue]Starting fetch for {self.owner}/{self.repo} from {self.start_date.date()} to present.[/bold blue]"
+        )
         prs = self.fetch_prs()
         issues = self.fetch_issues()
 

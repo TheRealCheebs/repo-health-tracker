@@ -2,24 +2,32 @@
 
 """
 Analyze raw PRs and Issues JSON to propose labeling for backlog cleanup.
-Focuses on open items and uses past labels to suggest labels for stale tickets.
+This version uses a rule-based engine and an external JSON taxonomy file.
 """
 
 import json
 import os
 import sys
-from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 import click
 
 # --- IMPORTANT ---
 # Add the 'src' directory to the Python path to import our project's modules
-# This is necessary for scripts that live outside the 'src' directory.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from repo_health.utils.helpers import parse_datetime
+
+
+def load_taxonomy(file_path: str) -> Dict[str, Any]:
+    """Loads the label taxonomy from a JSON file."""
+    if not os.path.exists(file_path):
+        click.echo(f"Error: Taxonomy file not found at {file_path}", err=True)
+        raise FileNotFoundError(f"Taxonomy file not found: {file_path}")
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 @click.command()
@@ -35,8 +43,19 @@ from repo_health.utils.helpers import parse_datetime
     help="Output file for the cleanup proposal",
     type=click.Path(dir_okay=False),
 )
-def main(data_dir: str, output: str):
+@click.option(
+    "--taxonomy-file",
+    default="label_taxonomy.json",
+    help="Path to the JSON file containing the label taxonomy.",
+    type=click.Path(exists=True, dir_okay=False),
+)
+def main(data_dir: str, output: str, taxonomy_file: str):
     """Generates a cleanup proposal for open PRs and issues."""
+    try:
+        taxonomy = load_taxonomy(taxonomy_file)
+    except FileNotFoundError:
+        return
+
     prs_path = os.path.join(data_dir, "prs_raw.json")
     issues_path = os.path.join(data_dir, "issues_raw.json")
 
@@ -51,9 +70,8 @@ def main(data_dir: str, output: str):
     with open(issues_path, "r", encoding="utf-8") as f:
         issues = json.load(f)
 
-    proposal = generate_proposals(prs, issues)
+    proposal = generate_proposals(prs, issues, taxonomy)
 
-    # Ensure the output directory exists
     os.makedirs(os.path.dirname(output), exist_ok=True)
 
     with open(output, "w", encoding="utf-8") as f:
@@ -65,58 +83,132 @@ def main(data_dir: str, output: str):
     )
 
 
-def suggest_labels(item: Dict[str, Any], past_label_counts: defaultdict) -> List[str]:
-    """Suggest labels based on previous label usage."""
-    # The new data structure has labels as a list of strings, e.g., ["bug", "enhancement"]
-    # If it has labels already, keep them.
-    if item.get("labels"):
-        return item["labels"]
+def infer_labels(
+    item: Dict[str, Any], taxonomy: Dict[str, Any]
+) -> Tuple[set[str], list[str]]:
+    """Infer a set of labels for an item based on its properties and the taxonomy."""
+    suggested_labels = set()
+    reasoning = []
 
-    # Otherwise, suggest the top label used historically for the same state.
-    state = item.get("state", "OPEN").lower()
-    most_common = past_label_counts[state].most_common(1)
-    return [most_common[0][0]] if most_common else []
+    keyword_map = taxonomy.get("keyword_map", {})
+    status_rules = taxonomy.get("status_rules", {})
+
+    # 1. Infer from title keywords
+    title = item.get("title", "").lower()
+    for label, keywords in keyword_map.items():
+        for keyword in keywords:
+            if keyword in title:
+                suggested_labels.add(label)
+                reasoning.append(f"Title contains keyword '{keyword}' -> {label}")
+
+    # 2. Infer from state and age
+    created_at = parse_datetime(item.get("createdAt"))
+    if not created_at:
+        return suggested_labels, reasoning
+
+    age_days = (datetime.now(timezone.utc) - created_at).days
+
+    # Check for draft status
+    if item.get("isDraft", False):
+        draft_label = status_rules.get("draft_label")
+        if draft_label:
+            suggested_labels.add(draft_label)
+            reasoning.append("Item is a draft PR -> status:draft")
+
+    # Check for triage status if it's an open item (including drafts)
+    if item.get("state") == "OPEN":
+        needs_triage_label = status_rules.get("needs_triage_label")
+        if needs_triage_label:
+            suggested_labels.add(needs_triage_label)
+            reasoning.append(f"Item state is OPEN -> {needs_triage_label}")
+
+        # Check for age/stale status (this is now independent of the draft check)
+        stale_threshold = status_rules.get("stale_threshold_days")
+        aging_threshold = status_rules.get("aging_threshold_days")
+
+        if stale_threshold and age_days > stale_threshold:
+            # If it's stale, mark it as stale and do not also mark it as aging
+            suggested_labels.add("status:stale")
+            reasoning.append(
+                f"Item is {age_days} days old (> {stale_threshold}) -> status:stale"
+            )
+        elif aging_threshold and age_days > aging_threshold:
+            # It's not stale, but it is aging
+            suggested_labels.add("status:aging")
+            reasoning.append(
+                f"Item is {age_days} days old (> {aging_threshold}) -> status:aging"
+            )
+
+    # 3. Ensure a scope is assigned
+    has_scope = any(label.startswith("scope:") for label in suggested_labels)
+    if not has_scope:
+        tbd_label = status_rules.get("tbd_label")
+        if tbd_label:
+            suggested_labels.add(tbd_label)
+            reasoning.append("No scope could be inferred -> {tbd_label}")
+
+    return suggested_labels, reasoning
 
 
 def generate_proposals(
-    prs: List[Dict[str, Any]], issues: List[Dict[str, Any]]
+    prs: List[Dict[str, Any]], issues: List[Dict[str, Any]], taxonomy: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Generates the cleanup proposal dictionary."""
-    # Build past label usage
-    past_label_counts = defaultdict(Counter)
-    for collection in [prs, issues]:
-        for item in collection:
-            state = item.get("state", "OPEN").lower()
-            # Labels are now a simple list of strings.
-            labels = item.get("labels") or []
-            for label_name in labels:
-                past_label_counts[state][label_name] += 1
-
     proposals = {"open_prs": [], "open_issues": []}
-    now = datetime.now(timezone.utc)
 
-    for collection, key in [(prs, "open_prs"), (issues, "open_issues")]:
-        for item in collection:
-            if item.get("state") != "OPEN":
-                continue
+    # Process PRs separately
+    for item in prs:
+        if item.get("state") not in ["OPEN", "DRAFT"]:
+            continue
 
-            created_at = parse_datetime(item.get("createdAt"))
-            age_days = (now - created_at).days if created_at else None
+        author_obj = item.get("author", {})
+        author_login = author_obj.get("login", "unknown")
 
-            # Author is now an object, so we need to get the login from it.
-            author_obj = item.get("author", {})
-            author_login = author_obj.get("login", "unknown")
+        created_at = parse_datetime(item.get("createdAt"))
+        age_days = (
+            (datetime.now(timezone.utc) - created_at).days if created_at else None
+        )
 
-            proposals[key].append(
-                {
-                    "number": item.get("number"),
-                    "title": item.get("title"),
-                    "author": author_login,
-                    "age_days": age_days,
-                    "current_labels": item.get("labels", []),
-                    "suggested_labels": suggest_labels(item, past_label_counts),
-                }
-            )
+        suggested_labels, reasoning = infer_labels(item, taxonomy)
+
+        proposals["open_prs"].append(
+            {
+                "number": item.get("number"),
+                "title": item.get("title"),
+                "author": author_login,
+                "age_days": age_days,
+                "current_labels": item.get("labels", []),
+                "suggested_labels": sorted(list(suggested_labels)),
+                "reasoning": reasoning,
+            }
+        )
+
+    # Process Issues separately
+    for item in issues:
+        if item.get("state") not in ["OPEN", "DRAFT"]:
+            continue
+
+        author_obj = item.get("author", {})
+        author_login = author_obj.get("login", "unknown")
+
+        created_at = parse_datetime(item.get("createdAt"))
+        age_days = (
+            (datetime.now(timezone.utc) - created_at).days if created_at else None
+        )
+
+        suggested_labels, reasoning = infer_labels(item, taxonomy)
+
+        proposals["open_issues"].append(
+            {
+                "number": item.get("number"),
+                "title": item.get("title"),
+                "author": author_login,
+                "age_days": age_days,
+                "current_labels": item.get("labels", []),
+                "suggested_labels": sorted(list(suggested_labels)),
+                "reasoning": reasoning,
+            }
+        )
 
     return proposals
 
