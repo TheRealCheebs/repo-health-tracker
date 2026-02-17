@@ -167,4 +167,7 @@ cython_debug/
 
 # Project specific
 data/*.json
+data/*.md
 repo_health.json
+final_report.json
+summary_report.json

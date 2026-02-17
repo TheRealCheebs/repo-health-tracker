@@ -2,7 +2,7 @@
 
 """
 Analyze raw PRs and Issues JSON to propose labeling for backlog cleanup.
-This version uses a rule-based engine and an external JSON taxonomy file.
+This version can output to JSON or a Markdown table.
 """
 
 import json
@@ -18,6 +18,7 @@ import click
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from repo_health.utils.helpers import parse_datetime
+from repo_health.config.settings import get_settings
 
 
 def load_taxonomy(file_path: str) -> Dict[str, Any]:
@@ -30,6 +31,80 @@ def load_taxonomy(file_path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+def write_json(proposal: Dict[str, Any], output_path: str):
+    """Writes the proposal as a JSON file."""
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(proposal, f, indent=2)
+
+
+def write_markdown(proposal: Dict[str, Any], output_path: str, owner: str, repo: str):
+    """Writes the proposal as a Markdown file with tables."""
+    base_url = f"https://github.com/{owner}/{repo}"
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(f"# Cleanup Proposal for {owner}/{repo}\n\n")
+        f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+        # Helper to create a table from a list of items
+        def create_table(items: List[Dict[str, Any]]):
+            if not items:
+                return "No items to display.\n"
+
+            header = (
+                "| # | Title | Author | Age | Current Labels | Suggested Labels |\n"
+            )
+            header += "|---|---|---|---|---|---|\n"
+
+            rows = ""
+            for item in items:
+                num = item.get("number")
+                title = item.get("title", "").replace("|", "\\|")  # Escape pipe chars
+                author = item.get("author", "")
+                age = f"{item.get('age_days', 'N/A')} days"
+                current = ", ".join(item.get("current_labels", [])).replace("|", "\\|")
+                suggested = ", ".join(item.get("suggested_labels", [])).replace(
+                    "|", "\\|"
+                )
+
+                rows += f"| [{num}]({base_url}/pull/{num}) | {title} | {author} | {age} | {current} | {suggested} |\n"
+
+            return header + rows + "\n"
+
+        # Write PRs table
+        f.write("## Pull Requests\n\n")
+        f.write(create_table(proposal.get("open_prs", [])))
+
+        # Write Issues table
+        f.write("## Issues\n\n")
+
+        # Note: The URL for issues is different from PRs
+        def create_issue_table(items: List[Dict[str, Any]]):
+            if not items:
+                return "No items to display.\n"
+
+            header = (
+                "| # | Title | Author | Age | Current Labels | Suggested Labels |\n"
+            )
+            header += "|---|---|---|---|---|---|\n"
+
+            rows = ""
+            for item in items:
+                num = item.get("number")
+                title = item.get("title", "").replace("|", "\\|")
+                author = item.get("author", "")
+                age = f"{item.get('age_days', 'N/A')} days"
+                current = ", ".join(item.get("current_labels", [])).replace("|", "\\|")
+                suggested = ", ".join(item.get("suggested_labels", [])).replace(
+                    "|", "\\|"
+                )
+
+                rows += f"| [{num}]({base_url}/issues/{num}) | {title} | {author} | {age} | {current} | {suggested} |\n"
+
+            return header + rows + "\n"
+
+        f.write(create_issue_table(proposal.get("open_issues", [])))
+
+
 @click.command()
 @click.option(
     "--data-dir",
@@ -39,8 +114,8 @@ def load_taxonomy(file_path: str) -> Dict[str, Any]:
 )
 @click.option(
     "--output",
-    default="data/cleanup_proposal.json",
-    help="Output file for the cleanup proposal",
+    default="data/cleanup_proposal",
+    help="Base path for the output file. The extension (.json or .md) will be added automatically.",
     type=click.Path(dir_okay=False),
 )
 @click.option(
@@ -49,7 +124,13 @@ def load_taxonomy(file_path: str) -> Dict[str, Any]:
     help="Path to the JSON file containing the label taxonomy.",
     type=click.Path(exists=True, dir_okay=False),
 )
-def main(data_dir: str, output: str, taxonomy_file: str):
+@click.option(
+    "--output-format",
+    default="json",
+    type=click.Choice(["json", "markdown"], case_sensitive=False),
+    help="The format for the output file.",
+)
+def main(data_dir: str, output: str, taxonomy_file: str, output_format: str):
     """Generates a cleanup proposal for open PRs and issues."""
     try:
         taxonomy = load_taxonomy(taxonomy_file)
@@ -72,12 +153,20 @@ def main(data_dir: str, output: str, taxonomy_file: str):
 
     proposal = generate_proposals(prs, issues, taxonomy)
 
-    os.makedirs(os.path.dirname(output), exist_ok=True)
+    # Determine final output path and writer
+    if output_format == "markdown":
+        output_path = f"{output}.md"
+        settings = get_settings()  # Get owner/repo for links
+        write_markdown(
+            proposal, output_path, settings.github_owner, settings.github_repo
+        )
+    else:  # Default to JSON
+        output_path = f"{output}.json"
+        write_json(proposal, output_path)
 
-    with open(output, "w", encoding="utf-8") as f:
-        json.dump(proposal, f, indent=2)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    click.echo(f"Cleanup proposal saved to {output}")
+    click.echo(f"Cleanup proposal saved to {output_path}")
     click.echo(
         f"{len(proposal['open_prs'])} open PRs, {len(proposal['open_issues'])} open Issues analyzed."
     )
@@ -93,7 +182,6 @@ def infer_labels(
     keyword_map = taxonomy.get("keyword_map", {})
     status_rules = taxonomy.get("status_rules", {})
 
-    # 1. Infer from title keywords
     title = item.get("title", "").lower()
     for label, keywords in keyword_map.items():
         for keyword in keywords:
@@ -101,45 +189,38 @@ def infer_labels(
                 suggested_labels.add(label)
                 reasoning.append(f"Title contains keyword '{keyword}' -> {label}")
 
-    # 2. Infer from state and age
     created_at = parse_datetime(item.get("createdAt"))
     if not created_at:
         return suggested_labels, reasoning
 
     age_days = (datetime.now(timezone.utc) - created_at).days
 
-    # Check for draft status
     if item.get("isDraft", False):
         draft_label = status_rules.get("draft_label")
         if draft_label:
             suggested_labels.add(draft_label)
             reasoning.append("Item is a draft PR -> status:draft")
 
-    # Check for triage status if it's an open item (including drafts)
     if item.get("state") == "OPEN":
         needs_triage_label = status_rules.get("needs_triage_label")
         if needs_triage_label:
             suggested_labels.add(needs_triage_label)
             reasoning.append(f"Item state is OPEN -> {needs_triage_label}")
 
-        # Check for age/stale status (this is now independent of the draft check)
         stale_threshold = status_rules.get("stale_threshold_days")
         aging_threshold = status_rules.get("aging_threshold_days")
 
         if stale_threshold and age_days > stale_threshold:
-            # If it's stale, mark it as stale and do not also mark it as aging
             suggested_labels.add("status:stale")
             reasoning.append(
                 f"Item is {age_days} days old (> {stale_threshold}) -> status:stale"
             )
         elif aging_threshold and age_days > aging_threshold:
-            # It's not stale, but it is aging
             suggested_labels.add("status:aging")
             reasoning.append(
                 f"Item is {age_days} days old (> {aging_threshold}) -> status:aging"
             )
 
-    # 3. Ensure a scope is assigned
     has_scope = any(label.startswith("scope:") for label in suggested_labels)
     if not has_scope:
         tbd_label = status_rules.get("tbd_label")
@@ -156,7 +237,6 @@ def generate_proposals(
     """Generates the cleanup proposal dictionary."""
     proposals = {"open_prs": [], "open_issues": []}
 
-    # Process PRs separately
     for item in prs:
         if item.get("state") not in ["OPEN", "DRAFT"]:
             continue
@@ -183,7 +263,6 @@ def generate_proposals(
             }
         )
 
-    # Process Issues separately
     for item in issues:
         if item.get("state") not in ["OPEN", "DRAFT"]:
             continue

@@ -39,6 +39,7 @@ dev = [
   "flake8>=4.0.0",
   "mypy>=0.900",
   "responses>=0.20.0",
+  "openai>=1.0.0",
 ]
 
 [project.scripts]
