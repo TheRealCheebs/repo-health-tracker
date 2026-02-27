@@ -1,7 +1,7 @@
 # Repo Health Analyzer
 
 [![uv](https://img.shields.io/badge/uv-0.1.0-blue.svg)](https://github.com/astral-sh/uv)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 This project provides a system to analyze the health of a GitHub repository over time. It collects raw pull request (PR) and issue data using GitHub GraphQL, normalizes it, and generates detailed metrics such as contributor activity, merge times, response times, backlog, and new contributor growth. The system is designed to be run incrementally on a weekly basis, providing a historical and rolling view of repository health.
@@ -85,7 +85,7 @@ Get up and running in just a few commands!
 
 ### 1. Prerequisites
 
-* **Python 3.9+**
+* **Python 3.12+**
 * **[uv](https://github.com/astral-sh/uv)**: The modern Python package installer.
 * **A Routstr API Key**: For generating narrative reports. Get one from [Routstr](https://routstr.com/).
 
